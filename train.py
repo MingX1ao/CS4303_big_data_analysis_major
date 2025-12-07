@@ -91,7 +91,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         
         # 5. 反向传播与更新
         loss.backward()
-        # 梯度裁剪：防止 LSTM 梯度爆炸 (金融数据常见的坑)
+        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         
