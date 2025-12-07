@@ -16,7 +16,7 @@ from model import WintonBaselineModel
 class TrainConfig:
     EPOCHS = 50
     BATCH_SIZE = 256
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 1e-4
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     SAVE_DIR = './checkpoints'
     MODEL_NAME = 'winton_hybrid_v1.pth'
