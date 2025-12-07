@@ -2,17 +2,9 @@ import torch
 import torch.nn as nn
 
 class WintonBaselineModel(nn.Module):
-    """Dual-encoder + dual-head model compatible with your existing pipeline.
+    """Dual-encoder + dual-head model with intraday-to-daily aggregation.
 
-    Interface is unchanged: forward(x_seq, x_tab) -> tensor shape [B, 62]
-
-    Design summary:
-      - LSTM_intra: models high-frequency minute signals (Ret_2..Ret_120)
-      - LSTM_daily: smaller LSTM modeling low-frequency/day-level signals
-      - Shared tabular encoder for Feature_* and Ret_MinusTwo/One
-      - Two independent heads (intra: 60 outputs, daily: 2 outputs)
-
-    This is the "A: 最小稳定版" architecture discussed earlier.
+    Interface unchanged: forward(x_seq, x_tab) -> [B, 62]
     """
 
     def __init__(self,
@@ -25,7 +17,6 @@ class WintonBaselineModel(nn.Module):
         super(WintonBaselineModel, self).__init__()
 
         # ------------------ intra (minute) encoder ------------------
-        # Deeper LSTM for capturing short-term micro-structure
         self.lstm_intra = nn.LSTM(
             input_size=seq_input_size,
             hidden_size=hidden_size,
@@ -35,17 +26,19 @@ class WintonBaselineModel(nn.Module):
         )
 
         # ------------------ daily encoder ------------------
-        # Smaller LSTM focused on learning smoother/day-level representations
-        self.lstm_daily = nn.LSTM(
-            input_size=seq_input_size,
-            hidden_size=daily_hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout_prob
+        # +5 from aggregated intraday features
+        self.daily_encoder = nn.Sequential(
+            nn.Linear(tabular_input_size + 5, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_prob),
+            nn.Linear(64, daily_hidden_size),
+            nn.BatchNorm1d(daily_hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_prob),
         )
 
         # ------------------ tabular encoder (shared) ------------------
-        # keep same behaviour as your previous MLP; normalized tabular inputs
         self.tabular_encoder = nn.Sequential(
             nn.Linear(tabular_input_size, 64),
             nn.BatchNorm1d(64),
@@ -56,8 +49,7 @@ class WintonBaselineModel(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # ------------------ heads (separate) ------------------
-        # intra head -> 60 outputs (minutes)
+        # ------------------ heads ------------------
         intra_fusion_dim = hidden_size + 32
         self.intra_head = nn.Sequential(
             nn.Linear(intra_fusion_dim, 128),
@@ -66,7 +58,6 @@ class WintonBaselineModel(nn.Module):
             nn.Linear(128, 60)
         )
 
-        # daily head -> 2 outputs (D+1, D+2)
         daily_fusion_dim = daily_hidden_size + 32
         self.daily_head = nn.Sequential(
             nn.Linear(daily_fusion_dim, 64),
@@ -75,9 +66,35 @@ class WintonBaselineModel(nn.Module):
             nn.Linear(64, 2)
         )
 
-        # small init
         self._init_weights()
 
+    # ------------------ intraday → daily aggregation ------------------
+    def _aggregate_intraday(self, x_seq):
+        """
+        x_seq: [B, 119, 1]
+        returns: [B, 5]
+        """
+        x = x_seq.squeeze(-1)        # [B, 119]
+
+        sum_all = x.sum(dim=1, keepdim=True)
+        sum_last30 = x[:, -30:].sum(dim=1, keepdim=True)
+
+        std_all = x.std(dim=1, keepdim=True)
+
+        max_abs = x.abs().max(dim=1, keepdim=True)[0]
+
+        # linear trend slope
+        t = torch.arange(x.shape[1], device=x.device).float()  # [119]
+        t = t - t.mean()
+        slope = (x * t).sum(dim=1, keepdim=True) / (t.pow(2).sum() + 1e-6)
+
+        daily_agg = torch.cat(
+            [sum_all, sum_last30, std_all, max_abs, slope], dim=1
+        )  # [B, 5]
+
+        return daily_agg
+
+    # ------------------ weight init ------------------
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Conv1d)):
@@ -93,40 +110,43 @@ class WintonBaselineModel(nn.Module):
                     elif 'bias' in name:
                         param.data.zero_()
 
+    # ------------------ forward ------------------
     def forward(self, x_seq, x_tab):
         """
         Args:
             x_seq: [B, 119, 1]
             x_tab: [B, 27]
         Returns:
-            out: [B, 62] where [:, :60] are minute preds and [:, 60:] are daily preds
+            out: [B, 62]
         """
+
         # ---- intra branch ----
-        # LSTM returns full sequence; take last time-step
-        lstm_out_intra, _ = self.lstm_intra(x_seq)            # [B, 119, hidden_size]
-        seq_emb_intra = lstm_out_intra[:, -1, :]             # [B, hidden_size]
+        lstm_out_intra, _ = self.lstm_intra(x_seq)
+        seq_emb_intra = lstm_out_intra[:, -1, :]
+
+        # ---- intraday → daily aggregation ----
+        daily_agg = self._aggregate_intraday(x_seq)   # [B, 5]
+        daily_input = torch.cat([x_tab, daily_agg], dim=1)  # [B, 32]
 
         # ---- daily branch ----
-        lstm_out_daily, _ = self.lstm_daily(x_seq)            # [B, 119, daily_hidden_size]
-        seq_emb_daily = lstm_out_daily[:, -1, :]             # [B, daily_hidden_size]
+        seq_emb_daily = self.daily_encoder(daily_input)
 
         # ---- tabular encoding (shared) ----
-        # BatchNorm1d expects [B, C]
-        tab_emb = self.tabular_encoder(x_tab)                # [B, 32]
+        tab_emb = self.tabular_encoder(x_tab)
 
         # ---- fusion & heads ----
-        intra_comb = torch.cat((seq_emb_intra, tab_emb), dim=1)   # [B, hidden+32]
-        daily_comb = torch.cat((seq_emb_daily, tab_emb), dim=1)   # [B, daily_hidden+32]
+        intra_comb = torch.cat((seq_emb_intra, tab_emb), dim=1)
+        daily_comb = torch.cat((seq_emb_daily, tab_emb), dim=1)
 
-        out_intra = self.intra_head(intra_comb)   # [B, 60]
-        out_daily = self.daily_head(daily_comb)   # [B, 2]
+        out_intra = self.intra_head(intra_comb)
+        out_daily = self.daily_head(daily_comb)
 
-        out = torch.cat((out_intra, out_daily), dim=1)   # [B, 62]
+        out = torch.cat((out_intra, out_daily), dim=1)
         return out
 
 
 # ============================
-# Quick smoke test (keeps same interface as before)
+# Quick smoke test
 # ============================
 if __name__ == "__main__":
     batch_size = 4
@@ -139,4 +159,4 @@ if __name__ == "__main__":
 
     model = WintonBaselineModel()
     out = model(dummy_seq, dummy_tab)
-    print("Output Shape:", out.shape)  # should be [4, 62]
+    print("Output Shape:", out.shape)  # [4, 62]
