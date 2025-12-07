@@ -14,7 +14,7 @@ from model import WintonBaselineModel
 # 配置部分
 # ==========================================
 class TrainConfig:
-    EPOCHS = 30
+    EPOCHS = 50
     BATCH_SIZE = 256
     LEARNING_RATE = 1e-3
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'

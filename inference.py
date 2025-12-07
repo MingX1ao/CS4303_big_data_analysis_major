@@ -14,7 +14,7 @@ class InferenceConfig:
     OUTPUT_FILE = 'submission.csv.gz' 
     BATCH_SIZE = 256
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ENABLE_ZERO_MEAN = True
+    ENABLE_ZERO_MEAN = False
 
 def predict_all(model, loader, device):
     model.eval()

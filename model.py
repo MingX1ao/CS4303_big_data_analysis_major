@@ -2,98 +2,141 @@ import torch
 import torch.nn as nn
 
 class WintonBaselineModel(nn.Module):
-    def __init__(self, 
-                 seq_input_size=1,      # 序列特征维度 (只有1列: return)
-                 tabular_input_size=27, # 静态特征维度 (Feature_1~25 + Ret_MinusOne/Two)
-                 hidden_size=64,        # LSTM 隐藏层大小
-                 output_size=62,        # 输出: 60分钟(121~180) + 2天(D+1, D+2)
-                 dropout_prob=0.3):     # Dropout 防止过拟合
-        
+    """Dual-encoder + dual-head model compatible with your existing pipeline.
+
+    Interface is unchanged: forward(x_seq, x_tab) -> tensor shape [B, 62]
+
+    Design summary:
+      - LSTM_intra: models high-frequency minute signals (Ret_2..Ret_120)
+      - LSTM_daily: smaller LSTM modeling low-frequency/day-level signals
+      - Shared tabular encoder for Feature_* and Ret_MinusTwo/One
+      - Two independent heads (intra: 60 outputs, daily: 2 outputs)
+
+    This is the "A: 最小稳定版" architecture discussed earlier.
+    """
+
+    def __init__(self,
+                 seq_input_size=1,
+                 tabular_input_size=27,
+                 hidden_size=64,
+                 daily_hidden_size=32,
+                 output_size=62,
+                 dropout_prob=0.3):
         super(WintonBaselineModel, self).__init__()
 
-        # ==================================
-        # 1. 时序分支 (处理 Ret_2 ~ Ret_120)
-        # ==================================
-        # 使用 LSTM 提取日内趋势
-        self.lstm = nn.LSTM(
+        # ------------------ intra (minute) encoder ------------------
+        # Deeper LSTM for capturing short-term micro-structure
+        self.lstm_intra = nn.LSTM(
             input_size=seq_input_size,
             hidden_size=hidden_size,
-            num_layers=2,           # 2层 LSTM 稍微增加一点深度
-            batch_first=True,       # [B, N, 1]
+            num_layers=2,
+            batch_first=True,
             dropout=dropout_prob
         )
-        
-        # ==================================
-        # 2. 静态分支 (处理 Features)
-        # ==================================
-        # 一个简单的 MLP 来提取基本面特征
+
+        # ------------------ daily encoder ------------------
+        # Smaller LSTM focused on learning smoother/day-level representations
+        self.lstm_daily = nn.LSTM(
+            input_size=seq_input_size,
+            hidden_size=daily_hidden_size,
+            num_layers=2,
+            batch_first=True,
+            dropout=dropout_prob
+        )
+
+        # ------------------ tabular encoder (shared) ------------------
+        # keep same behaviour as your previous MLP; normalized tabular inputs
         self.tabular_encoder = nn.Sequential(
             nn.Linear(tabular_input_size, 64),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout_prob),
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
-            nn.ReLU()
+            nn.ReLU(inplace=True)
         )
 
-        # ==================================
-        # 3. 融合与预测头 (Head)
-        # ==================================
-        # 融合后的维度 = LSTM输出 + 表格输出(32)
-        fusion_dim = hidden_size + 32
-        
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, 64),
-            nn.ReLU(),
+        # ------------------ heads (separate) ------------------
+        # intra head -> 60 outputs (minutes)
+        intra_fusion_dim = hidden_size + 32
+        self.intra_head = nn.Sequential(
+            nn.Linear(intra_fusion_dim, 128),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout_prob),
-            nn.Linear(64, output_size) # 输出层，直接预测62个值
+            nn.Linear(128, 60)
         )
+
+        # daily head -> 2 outputs (D+1, D+2)
+        daily_fusion_dim = daily_hidden_size + 32
+        self.daily_head = nn.Sequential(
+            nn.Linear(daily_fusion_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_prob),
+            nn.Linear(64, 2)
+        )
+
+        # small init
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param.data)
+                    elif 'bias' in name:
+                        param.data.zero_()
 
     def forward(self, x_seq, x_tab):
         """
         Args:
-            x_seq: [B, 119, 1]: 序列数据
-            x_tab: [B, 27]    : 表格数据
+            x_seq: [B, 119, 1]
+            x_tab: [B, 27]
+        Returns:
+            out: [B, 62] where [:, :60] are minute preds and [:, 60:] are daily preds
         """
-        
-        # --- 1. 处理序列数据 ---
-        lstm_out, _ = self.lstm(x_seq)      # [B, 119, hidden_size]
-        
-        # 取最后一个时间步的特征，代表"目前为止的市场状态"
-        seq_embedding = lstm_out[:, -1, :] # [B, hidden_size]
+        # ---- intra branch ----
+        # LSTM returns full sequence; take last time-step
+        lstm_out_intra, _ = self.lstm_intra(x_seq)            # [B, 119, hidden_size]
+        seq_emb_intra = lstm_out_intra[:, -1, :]             # [B, hidden_size]
 
-        # --- 2. 处理静态数据 ---
-        tab_embedding = self.tabular_encoder(x_tab) # [B, 32]
+        # ---- daily branch ----
+        lstm_out_daily, _ = self.lstm_daily(x_seq)            # [B, 119, daily_hidden_size]
+        seq_emb_daily = lstm_out_daily[:, -1, :]             # [B, daily_hidden_size]
 
-        # --- 3. 特征融合 ---
-        combined = torch.cat((seq_embedding, tab_embedding), dim=1)     # [Batch, hidden_size + 32]
+        # ---- tabular encoding (shared) ----
+        # BatchNorm1d expects [B, C]
+        tab_emb = self.tabular_encoder(x_tab)                # [B, 32]
 
-        # --- 4. 最终预测 ---
-        out = self.head(combined) # [B, 62]
-        
+        # ---- fusion & heads ----
+        intra_comb = torch.cat((seq_emb_intra, tab_emb), dim=1)   # [B, hidden+32]
+        daily_comb = torch.cat((seq_emb_daily, tab_emb), dim=1)   # [B, daily_hidden+32]
+
+        out_intra = self.intra_head(intra_comb)   # [B, 60]
+        out_daily = self.daily_head(daily_comb)   # [B, 2]
+
+        out = torch.cat((out_intra, out_daily), dim=1)   # [B, 62]
         return out
 
-# ==========================================
-# 简单的模型测试代码
-# ==========================================
+
+# ============================
+# Quick smoke test (keeps same interface as before)
+# ============================
 if __name__ == "__main__":
-    # 模拟一个 Batch 的数据
     batch_size = 4
     seq_len = 119
     seq_feat = 1
     tab_feat = 27
-    
-    # 随机生成数据
+
     dummy_seq = torch.randn(batch_size, seq_len, seq_feat)
     dummy_tab = torch.randn(batch_size, tab_feat)
-    
-    # 实例化模型
+
     model = WintonBaselineModel()
-    
-    # 前向传播
-    output = model(dummy_seq, dummy_tab)
-    
-    print("Input Sequence:", dummy_seq.shape)
-    print("Input Tabular:", dummy_tab.shape)
-    print("Output Shape:", output.shape) # 应该是 [4, 62]
+    out = model(dummy_seq, dummy_tab)
+    print("Output Shape:", out.shape)  # should be [4, 62]
