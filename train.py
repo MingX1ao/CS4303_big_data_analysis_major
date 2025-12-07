@@ -15,7 +15,7 @@ from model import WintonBaselineModel
 # ==========================================
 class TrainConfig:
     EPOCHS = 30
-    BATCH_SIZE = 64
+    BATCH_SIZE = 256
     LEARNING_RATE = 1e-3
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     SAVE_DIR = './checkpoints'
@@ -23,7 +23,7 @@ class TrainConfig:
     
     # Daily Loss 更高的系数，强迫模型关注跨日预测
     LAMBDA_INTRADAY = 1.0
-    LAMBDA_DAILY = 5.0 
+    LAMBDA_DAILY = 1.0 
 
 # ==========================================
 # 自定义损失函数
@@ -91,7 +91,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         
         # 5. 反向传播与更新
         loss.backward()
-        # 梯度裁剪
+        # 梯度裁剪：防止 LSTM 梯度爆炸 (金融数据常见的坑)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         
